@@ -14,7 +14,7 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 
-app = FastAPI(title="Aivox Universal Agent Production Fix")
+app = FastAPI(title="Aivox Universal Agent Seamless")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 SESSION_CACHE = {"bytes": None, "name": "aivox_batch_output.zip"}
@@ -67,7 +67,6 @@ async def batch_process(
                     for field, target in mapping_dict.items():
                         val = str(row_data.get(field, ""))
                         if val and val != "nan" and 'x' in target and 'y' in target:
-                            # PDF coordinates use standard points
                             can.drawString(float(target['x']), float(target['y']), val)
                     can.save()
                     
@@ -90,7 +89,6 @@ async def batch_process(
                     for field, coords in mapping_dict.items():
                         val = str(row_data.get(field, ""))
                         if val and val != "nan" and 'x' in coords and 'y' in coords:
-                            # Draws on the real full-scale image dimensions
                             draw.text((float(coords['x']), float(coords['y'])), val, fill="black")
                     
                     out_buf = io.BytesIO()
@@ -127,7 +125,7 @@ async def interface():
         <script src="https://cdn.tailwindcss.com"></script>
         <style>
             .canvas-container { position: relative; display: inline-block; cursor: crosshair; }
-            .marker { position: absolute; background: #4f46e5; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; transform: translate(-50%, -50%); pointer-events: none; }
+            .marker { position: absolute; background: #4f46e5; color: white; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; transform: translate(-50%, -50%); pointer-events: none; z-index: 10; }
             .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); z-index: 100; justify-content: center; align-items: center; }
         </style>
     </head>
@@ -194,7 +192,7 @@ async def interface():
 
             <div id="errorPanel" class="w-full max-w-xl bg-slate-900 border-2 border-rose-500/40 p-6 rounded-xl hidden">
                 <p class="text-rose-400 font-bold mb-2">⚠️ Engine Execution Aborted</p>
-                <pre id="errorText" class="bg-black/50 text-rose-300 p-4 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap></pre>
+                <pre id="errorText" class="bg-black/50 text-rose-300 p-4 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap"></pre>
             </div>
 
             <div id="successPanel" class="w-full max-w-md bg-slate-900 border-2 border-emerald-500/30 p-8 rounded-2xl hidden text-center space-y-4">
@@ -217,6 +215,7 @@ async def interface():
             let selectedField = null;
             let nativeWidth = 0;
             let nativeHeight = 0;
+            let activeTemplateBlob = null; // Caches raw data seamlessly
 
             function switchLayoutMode() {
                 const type = document.getElementById('layoutType').value;
@@ -228,6 +227,7 @@ async def interface():
                 document.getElementById('welcome').classList.remove('hidden');
                 mapping = {};
                 document.querySelectorAll('.marker').forEach(m => m.remove());
+                activeTemplateBlob = null;
                 
                 if(type === 'xlsx') {
                     document.getElementById('excelBox').classList.remove('hidden');
@@ -239,7 +239,10 @@ async def interface():
             }
 
             document.getElementById('tpl').onchange = e => {
-                if(!e.target.files[0]) return;
+                const file = e.target.files[0];
+                if(!file) return;
+                activeTemplateBlob = file; // Locks reference securely
+                
                 const type = document.getElementById('layoutType').value;
                 if (type === 'image') {
                     const fr = new FileReader();
@@ -256,7 +259,7 @@ async def interface():
                         };
                         img.src = fr.result;
                     }
-                    fr.readAsDataURL(e.target.files[0]);
+                    fr.readAsDataURL(file);
                 }
             }
 
@@ -299,18 +302,15 @@ async def interface():
                 }
             }
 
-            // PIXEL-PERFECT SCALING CLICK LOGIC
             document.getElementById('canvasBox').onclick = e => {
-                if(!selectedField) return alert("Select a source field from the left panel first.");
+                if(!selectedField) return;
                 
                 const imgElement = document.getElementById('view');
                 const rect = imgElement.getBoundingClientRect();
                 
-                // Get exactly where the click landed inside the display box
                 const displayX = e.clientX - rect.left;
                 const displayY = e.clientY - rect.top;
                 
-                // Scale coordinates relative to the full-size source image dimensions
                 const scaleX = nativeWidth / rect.width;
                 const scaleY = nativeHeight / rect.height;
                 
@@ -320,7 +320,6 @@ async def interface():
                 mapping[selectedField] = { x: actualX, y: actualY };
                 updateFieldStatus(selectedField);
                 
-                // Render visual marker pinned safely on the layout screen
                 const m = document.createElement('div');
                 m.className = 'marker';
                 m.style.left = displayX + 'px';
@@ -377,10 +376,12 @@ async def interface():
             }
 
             async function runUniversalAgent() {
-                const tplFile = document.getElementById('tpl').files[0];
+                const inputTplFile = document.getElementById('tpl').files[0];
+                const tplFile = inputTplFile || activeTemplateBlob; // Fallback validation structure
                 const dataFile = document.getElementById('csv').files[0];
                 const lType = document.getElementById('layoutType').value;
-                if(!tplFile || !dataFile) return alert("Upload template and data targets.");
+                
+                if(!tplFile || !dataFile) return alert("Please check your uploads. Both layout template and data sheet must be present.");
 
                 const btn = document.getElementById('execBtn');
                 btn.innerText = "PROCESSING..."; btn.disabled = true;
@@ -405,7 +406,7 @@ async def interface():
                     document.getElementById('pdfBox').classList.add('hidden');
                     document.getElementById('welcome').classList.add('hidden');
                     
-                    document.getElementById('successMeta').innerText = `Processed ${resData.count} data rows successfully.`;
+                    document.getElementById('successMeta').innerText = `Processed ${resData.count} entries onto your layout framework smoothly.`;
                     document.getElementById('successPanel').classList.remove('hidden');
                 } catch(e) {
                     document.getElementById('errorText').innerText = e.message;
