@@ -4,18 +4,18 @@ import json
 import base64
 import pandas as pd
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw
 from pypdf import PdfReader, PdfWriter
+import zipfile
 
-app = FastAPI(title="Aivox Universal Agent Pro")
+app = FastAPI(title="Aivox Universal Agent Elite")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def helper_read_dataframe(file_bytes, filename: str) -> pd.DataFrame:
     file_buffer = io.BytesIO(file_bytes)
     if filename.lower().endswith(('.xlsx', '.xls')):
-        # engine="openpyxl" ensures .xlsx files are parsed with zero metadata errors
         return pd.read_excel(file_buffer, engine="openpyxl")
     return pd.read_csv(file_buffer)
 
@@ -27,7 +27,6 @@ async def get_headers(data_file: UploadFile = File(...)):
         headers = [str(col).strip() for col in df.columns]
         return JSONResponse(content={"headers": headers})
     except Exception as e:
-        # Returns the actual error to the frontend console for debugging
         return JSONResponse(status_code=400, content={"error": str(e)})
 
 @app.post("/batch-process")
@@ -41,44 +40,55 @@ async def batch_process(
         df = helper_read_dataframe(await data_file.read(), data_file.filename)
         tpl_bytes = await template.read()
         mapping_dict = json.loads(mapping)
-        sample_row = df.iloc[0].to_dict()
         
-        if layout_type == "image":
-            img = Image.open(io.BytesIO(tpl_bytes)).convert("RGB")
-            draw = ImageDraw.Draw(img)
-            for field, coords in mapping_dict.items():
-                val = str(sample_row.get(field, ""))
-                if val and val != "nan":
-                    draw.text((float(coords['x']), float(coords['y'])), val, fill="black")
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
-            encoded = base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-            return JSONResponse(content={"sample_render": encoded, "type": "image", "count": len(df)})
-            
-        elif layout_type == "pdf":
-            # Native Form-Field Fill Strategy for Interactive PDFs
-            reader = PdfReader(io.BytesIO(tpl_bytes))
-            writer = PdfWriter()
-            writer.append(reader)
-            
-            field_data = {}
-            for field, target in mapping_dict.items():
-                val = str(sample_row.get(field, ""))
-                if val and val != "nan":
-                    field_data[target.get('pdfField')] = val
-                    
-            try:
-                writer.update_page_form_field_values(writer.pages[0], field_data)
-            except:
-                pass # Silently proceed if PDF structure doesn't support interactive forms
+        # We create an in-memory zip file to store all generated files
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            # Process every single row inside the data sheet (15 rows)
+            for index, row in df.iterrows():
+                row_data = row.to_dict()
+                filename = f"Invoice_{index + 1}.pdf" if layout_type == "pdf" else f"Document_{index + 1}.png"
                 
-            pdf_buffer = io.BytesIO()
-            writer.write(pdf_buffer)
-            encoded = base64.b64encode(pdf_buffer.getvalue()).decode('utf-8')
-            return JSONResponse(content={"sample_render": encoded, "type": "pdf", "count": len(df)})
-            
-        elif layout_type == "xlsx":
-            return JSONResponse(content={"status": "Excel blueprint verified", "type": "xlsx", "count": len(df)})
+                if layout_type == "pdf":
+                    reader = PdfReader(io.BytesIO(tpl_bytes))
+                    writer = PdfWriter()
+                    writer.append(reader)
+                    
+                    field_data = {}
+                    for field, target in mapping_dict.items():
+                        val = str(row_data.get(field, ""))
+                        if val and val != "nan" and target.get('pdfField'):
+                            field_data[target.get('pdfField')] = val
+                    
+                    try:
+                        writer.update_page_form_field_values(writer.pages[0], field_data)
+                    except:
+                        pass
+                    
+                    out_buf = io.BytesIO()
+                    writer.write(out_buf)
+                    zip_file.writestr(filename, out_buf.getvalue())
+                    
+                elif layout_type == "image":
+                    img = Image.open(io.BytesIO(tpl_bytes)).convert("RGB")
+                    draw = ImageDraw.Draw(img)
+                    for field, coords in mapping_dict.items():
+                        val = str(row_data.get(field, ""))
+                        if val and val != "nan":
+                            draw.text((float(coords['x']), float(coords['y'])), val, fill="black")
+                    
+                    out_buf = io.BytesIO()
+                    img.save(out_buf, format='PNG')
+                    zip_file.writestr(filename, out_buf.getvalue())
+        
+        zip_buffer.seek(0)
+        # Returns raw binary stream to the front-end to trigger immediate download window
+        return StreamingResponse(
+            zip_buffer, 
+            media_type="application/zip", 
+            headers={"Content-Disposition": "attachment; filename=aivox_batch_output.zip"}
+        )
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -146,7 +156,7 @@ async def interface():
                 </div>
             </div>
 
-            <button onclick="runUniversalAgent()" class="bg-indigo-600 hover:bg-indigo-500 py-4 rounded-xl font-bold text-white shadow-lg transition-all">EXECUTE BATCH PROCESSING</button>
+            <button id="execBtn" onclick="runUniversalAgent()" class="bg-indigo-600 hover:bg-indigo-500 py-4 rounded-xl font-bold text-white shadow-lg transition-all">EXECUTE BATCH PROCESSING</button>
         </aside>
 
         <main class="flex-1 p-8 flex flex-col items-center justify-center overflow-auto bg-slate-950">
@@ -276,7 +286,7 @@ async def interface():
                         div.appendChild(b);
                     });
                 } catch(err) {
-                    div.innerHTML = `<p class="text-xs text-rose-400 text-center mt-4">Error parsing input metadata.</p>`;
+                    div.innerHTML = `<p class="text-xs text-rose-400 text-center mt-4">Error parsing input metadata.</p>';
                 }
             }
 
@@ -335,6 +345,10 @@ async def interface():
                 const lType = document.getElementById('layoutType').value;
                 if(!tplFile || !dataFile) return alert("Upload template and data targets.");
 
+                const btn = document.getElementById('execBtn');
+                btn.innerText = "PROCESSING BATCH PACKETS...";
+                btn.disabled = true;
+
                 const fd = new FormData();
                 fd.append('template', tplFile);
                 fd.append('data_file', dataFile);
@@ -343,14 +357,26 @@ async def interface():
                 
                 try {
                     const res = await fetch('/batch-process', { method: 'POST', body: fd });
-                    const data = await res.json();
-                    alert(`Success! Universal processing pipeline executed for ${data.count} rows.`);
-                    if(data.type === 'image') {
-                        document.getElementById('view').src = "data:image/png;base64," + data.sample_render;
-                        document.querySelectorAll('.marker').forEach(m => m.remove());
-                    }
+                    if(!res.ok) throw new Error("Processing failed");
+                    
+                    // Directly capture the binary file payload from response stream
+                    const blob = await res.blob();
+                    const url = window.URL.createObjectURL(blob);
+                    
+                    // Auto-trigger browser local download window
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = "aivox_batch_output.zip";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    
+                    alert("Success! Archive packet containing all outputs generated and downloaded successfully.");
                 } catch(e) {
-                    alert('Batch automation completed with system tracking configurations.');
+                    alert('Batch automation stream error.');
+                } finally {
+                    btn.innerText = "EXECUTE BATCH PROCESSING";
+                    btn.disabled = false;
                 }
             }
         </script>
