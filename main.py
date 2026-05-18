@@ -7,11 +7,18 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageDraw
-from pypdf import PdfReader, PdfWriter
 import zipfile
 
-app = FastAPI(title="Aivox Universal Agent Elite")
+# PDF text placement engine libraries
+from pypdf import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+
+app = FastAPI(title="Aivox Universal Agent Diagnostics")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Global session cache to hold the last processed zip file cleanly
+SESSION_CACHE = {"bytes": None, "name": "aivox_batch_output.zip"}
 
 def helper_read_dataframe(file_bytes, filename: str) -> pd.DataFrame:
     file_buffer = io.BytesIO(file_bytes)
@@ -41,31 +48,43 @@ async def batch_process(
         tpl_bytes = await template.read()
         mapping_dict = json.loads(mapping)
         
-        # We create an in-memory zip file to store all generated files
+        if not mapping_dict:
+            raise Exception("Your mapping configuration is empty. Please link at least one field before executing.")
+
         zip_buffer = io.BytesIO()
         
         with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            # Process every single row inside the data sheet (15 rows)
             for index, row in df.iterrows():
                 row_data = row.to_dict()
                 filename = f"Invoice_{index + 1}.pdf" if layout_type == "pdf" else f"Document_{index + 1}.png"
                 
                 if layout_type == "pdf":
+                    # Universal PDF Vector Overlay Mapping Strategy
                     reader = PdfReader(io.BytesIO(tpl_bytes))
                     writer = PdfWriter()
-                    writer.append(reader)
                     
-                    field_data = {}
+                    # Generate an overlay layer using reportlab canvas
+                    packet = io.BytesIO()
+                    can = canvas.Canvas(packet, pagesize=letter)
+                    
                     for field, target in mapping_dict.items():
                         val = str(row_data.get(field, ""))
-                        if val and val != "nan" and target.get('pdfField'):
-                            field_data[target.get('pdfField')] = val
+                        if val and val != "nan":
+                            # Fallback default values if structured points are missing
+                            x_coord = float(target.get('x', 100))
+                            y_coord = float(target.get('y', 700))
+                            can.drawString(x_coord, y_coord, val)
+                    can.save()
                     
-                    try:
-                        writer.update_page_form_field_values(writer.pages[0], field_data)
-                    except:
-                        pass
+                    packet.seek(0)
+                    new_pdf = PdfReader(packet)
                     
+                    # Merge overlay logic onto the target baseline template page
+                    page = reader.pages[0]
+                    if len(new_pdf.pages) > 0:
+                        page.merge_page(new_pdf.pages[0])
+                    
+                    writer.add_page(page)
                     out_buf = io.BytesIO()
                     writer.write(out_buf)
                     zip_file.writestr(filename, out_buf.getvalue())
@@ -82,16 +101,26 @@ async def batch_process(
                     img.save(out_buf, format='PNG')
                     zip_file.writestr(filename, out_buf.getvalue())
         
-        zip_buffer.seek(0)
-        # Returns raw binary stream to the front-end to trigger immediate download window
-        return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip", 
-            headers={"Content-Disposition": "attachment; filename=aivox_batch_output.zip"}
-        )
+        zip_data = zip_buffer.getvalue()
+        if len(zip_data) == 0:
+            raise Exception("The generated ZIP archive package is completely empty.")
+            
+        SESSION_CACHE["bytes"] = zip_data
+        return JSONResponse(content={"status": "success", "count": len(df)})
             
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Pushes explicit error logs right to the user dashboard view
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+@app.get("/download-latest-bundle")
+async def download_latest_bundle():
+    if not SESSION_CACHE["bytes"]:
+        raise HTTPException(status_code=404, detail="No processed zip archives found.")
+    return StreamingResponse(
+        io.BytesIO(SESSION_CACHE["bytes"]), 
+        media_type="application/zip", 
+        headers={"Content-Disposition": f"attachment; filename={SESSION_CACHE['name']}"}
+    )
 
 @app.get("/", response_class=HTMLResponse)
 async def interface():
@@ -99,7 +128,7 @@ async def interface():
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <meta charset="UTF-8"><title>Aivox Universal Agent</title>
+        <meta charset="UTF-8"><title>Aivox Universal Agent Engine</title>
         <script src="https://cdn.tailwindcss.com"></script>
         <style>
             .canvas-container { position: relative; cursor: crosshair; display: inline-block; }
@@ -113,7 +142,7 @@ async def interface():
             <div class="flex items-center justify-between">
                 <div>
                     <h1 class="text-2xl font-black text-indigo-400">AIVOX AGENT</h1>
-                    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Universal Mode</p>
+                    <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest">Universal Environment</p>
                 </div>
                 <button onclick="toggleModal(true)" class="px-3 py-1.5 bg-indigo-600/20 hover:bg-indigo-600 text-indigo-400 hover:text-white rounded-lg font-bold text-xs transition-all">
                     ＋ Client
@@ -125,7 +154,6 @@ async def interface():
                     <label class="block text-xs font-bold text-slate-400 uppercase mb-1">Active Client Profile</label>
                     <select id="client" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-2 text-sm text-white outline-none">
                         <option>ELPINE</option>
-                        <option>Safaricom Ltd</option>
                     </select>
                 </div>
 
@@ -171,15 +199,32 @@ async def interface():
             </div>
 
             <div id="pdfBox" class="w-full max-w-4xl bg-slate-900 border border-slate-800 p-6 rounded-xl hidden">
-                <h3 class="text-sm font-bold mb-4 text-slate-400">PDF Form Fill Value Schema</h3>
-                <p class="text-xs text-slate-500 mb-4">Type the exact string names of the interactive PDF form fields:</p>
+                <h3 class="text-sm font-bold mb-4 text-slate-400">PDF Coordinate Overlay Configuration</h3>
+                <p class="text-xs text-slate-500 mb-4">Assign structural layout positional properties directly to your dataset headers:</p>
                 <div id="pdfForm" class="space-y-3"></div>
+            </div>
+
+            <div id="errorPanel" class="w-full max-w-xl bg-slate-900 border-2 border-rose-500/40 p-6 rounded-xl hidden">
+                <div class="flex items-center gap-3 text-rose-400 font-bold mb-2">
+                    <span>⚠️ Engine Execution Aborted</span>
+                </div>
+                <p class="text-xs text-slate-400 mb-3">The backend Python container returned the following error string:</p>
+                <pre id="errorText" class="bg-black/50 text-rose-300 p-4 rounded-lg text-xs font-mono overflow-x-auto whitespace-pre-wrap border border-rose-950"></pre>
+            </div>
+
+            <div id="successPanel" class="w-full max-w-md bg-slate-900 border-2 border-emerald-500/30 p-8 rounded-2xl hidden text-center space-y-4">
+                <div class="text-5xl">📦</div>
+                <h2 class="text-xl font-bold text-emerald-400">Batch Processing Complete!</h2>
+                <p id="successMeta" class="text-xs text-slate-400">Records processed securely.</p>
+                <a href="/download-latest-bundle" target="_blank" class="block w-full text-center bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3.5 px-4 rounded-xl shadow-lg transition-all">
+                    📥 Download Output ZIP Bundle
+                </a>
             </div>
 
             <div id="welcome" class="text-slate-500 text-center max-w-sm">
                 <div class="text-5xl mb-4">⚙️</div>
                 <p class="text-lg font-medium text-slate-400">Workspace Standard View</p>
-                <p class="text-xs text-slate-500 mt-1">Select your client configuration framework to initialize mapping fields.</p>
+                <p class="text-xs text-slate-500 mt-1">Select your client framework target configuration to initialize layout mapping.</p>
             </div>
         </main>
 
@@ -218,9 +263,10 @@ async def interface():
                 document.getElementById('canvasBox').classList.add('hidden');
                 document.getElementById('excelBox').classList.add('hidden');
                 document.getElementById('pdfBox').classList.add('hidden');
+                document.getElementById('successPanel').classList.add('hidden');
+                document.getElementById('errorPanel').classList.add('hidden');
                 document.getElementById('welcome').classList.remove('hidden');
                 mapping = {};
-                document.querySelectorAll('.marker').forEach(m => m.remove());
                 
                 if(type === 'xlsx') {
                     document.getElementById('excelBox').classList.remove('hidden');
@@ -244,6 +290,8 @@ async def interface():
                         document.getElementById('view').src = fr.result;
                         document.getElementById('canvasBox').classList.remove('hidden');
                         document.getElementById('welcome').classList.add('hidden');
+                        document.getElementById('successPanel').classList.add('hidden');
+                        document.getElementById('errorPanel').classList.add('hidden');
                     }
                     fr.readAsDataURL(e.target.files[0]);
                 }
@@ -281,30 +329,13 @@ async def interface():
                             
                             const type = document.getElementById('layoutType').value;
                             if (type === 'xlsx') { addStructuralInputRow(h, 'excelForm', 'cell'); }
-                            if (type === 'pdf') { addStructuralInputRow(h, 'pdfForm', 'pdfField'); }
+                            if (type === 'pdf') { addPdfCoordinateInputRow(h); }
                         }
                         div.appendChild(b);
                     });
                 } catch(err) {
-                    div.innerHTML = `<p class="text-xs text-rose-400 text-center mt-4">Error parsing input metadata.</p>';
+                    div.innerHTML = `<p class="text-xs text-rose-400 text-center mt-4">Error parsing input metadata.</p>`;
                 }
-            }
-
-            document.getElementById('canvasBox').onclick = e => {
-                if(!selectedField) return;
-                const rect = document.getElementById('view').getBoundingClientRect();
-                const x = e.clientX - rect.left;
-                const y = e.clientY - rect.top;
-                
-                mapping[selectedField] = {x, y};
-                updateFieldStatus(selectedField);
-                
-                const m = document.createElement('div');
-                m.className = 'marker';
-                m.style.left = x + 'px'; m.style.top = y + 'px';
-                m.innerText = selectedField;
-                document.getElementById('canvasBox').appendChild(m);
-                selectedField = null;
             }
 
             function addStructuralInputRow(field, formId, attributeKey) {
@@ -316,11 +347,31 @@ async def interface():
                 d.id = safeId;
                 d.className = "flex items-center gap-4 bg-slate-950 p-2 rounded-lg border border-slate-800";
                 
-                placeholderText = attributeKey === 'cell' ? 'e.g. B4' : 'e.g. invoice_total_field';
-                
                 d.innerHTML = `<span class="text-xs font-medium w-1/3 text-slate-300">${field}</span>
-                               <input type="text" placeholder="${placeholderText}" onchange="registerStructuralValue('${field}', '${attributeKey}', this.value)" class="bg-slate-900 border border-slate-700 text-xs text-white p-2 rounded-md outline-none focus:border-indigo-500 w-2/3">`;
+                               <input type="text" placeholder="e.g. B4" onchange="registerStructuralValue('${field}', '${attributeKey}', this.value)" class="bg-slate-900 border border-slate-700 text-xs text-white p-2 rounded-md outline-none focus:border-indigo-500 w-2/3">`;
                 form.appendChild(d);
+            }
+
+            function addPdfCoordinateInputRow(field) {
+                const form = document.getElementById('pdfForm');
+                const safeId = 'inp-pdf-' + field.replace(/[^a-zA-Z0-9]/g, "_");
+                if(document.getElementById(safeId)) return;
+                
+                const d = document.createElement('div');
+                d.id = safeId;
+                d.className = "flex gap-4 items-center bg-slate-950 p-3 rounded-lg border border-slate-800";
+                d.innerHTML = `
+                    <span class="text-xs font-medium w-1/4 text-slate-300">${field}</span>
+                    <input type="number" placeholder="X Coord (e.g. 100)" onchange="registerPdfCoord('${field}', 'x', this.value)" class="w-3/8 bg-slate-900 border border-slate-700 text-xs text-white p-2 rounded-md outline-none focus:border-indigo-500">
+                    <input type="number" placeholder="Y Coord (e.g. 700)" onchange="registerPdfCoord('${field}', 'y', this.value)" class="w-3/8 bg-slate-900 border border-slate-700 text-xs text-white p-2 rounded-md outline-none focus:border-indigo-500">
+                `;
+                form.appendChild(d);
+            }
+
+            function registerPdfCoord(field, axes, value) {
+                if(!mapping[field]) mapping[field] = {};
+                mapping[field][axes] = value;
+                updateFieldStatus(field);
             }
 
             function registerStructuralValue(field, key, value) {
@@ -343,11 +394,14 @@ async def interface():
                 const tplFile = document.getElementById('tpl').files[0];
                 const dataFile = document.getElementById('csv').files[0];
                 const lType = document.getElementById('layoutType').value;
-                if(!tplFile || !dataFile) return alert("Upload template and data targets.");
+                if(!tplFile || !dataFile) return alert("Please make sure both layout template and target data sheet are uploaded.");
 
                 const btn = document.getElementById('execBtn');
-                btn.innerText = "PROCESSING BATCH PACKETS...";
+                btn.innerText = "PROCESSING PACKETS...";
                 btn.disabled = true;
+
+                document.getElementById('successPanel').classList.add('hidden');
+                document.getElementById('errorPanel').classList.add('hidden');
 
                 const fd = new FormData();
                 fd.append('template', tplFile);
@@ -357,23 +411,28 @@ async def interface():
                 
                 try {
                     const res = await fetch('/batch-process', { method: 'POST', body: fd });
-                    if(!res.ok) throw new Error("Processing failed");
+                    const resData = await res.json();
                     
-                    // Directly capture the binary file payload from response stream
-                    const blob = await res.blob();
-                    const url = window.URL.createObjectURL(blob);
+                    if (!res.ok || resData.error) {
+                        throw new Error(resData.error || "Execution Interrupted");
+                    }
                     
-                    // Auto-trigger browser local download window
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = "aivox_batch_output.zip";
-                    document.body.appendChild(a);
-                    a.click();
-                    a.remove();
+                    document.getElementById('canvasBox').classList.add('hidden');
+                    document.getElementById('excelBox').classList.add('hidden');
+                    document.getElementById('pdfBox').classList.add('hidden');
+                    document.getElementById('welcome').classList.add('hidden');
                     
-                    alert("Success! Archive packet containing all outputs generated and downloaded successfully.");
+                    document.getElementById('successMeta').innerText = `Processed ${resData.count} data instances into matching templates.`;
+                    document.getElementById('successPanel').classList.remove('hidden');
+                    
                 } catch(e) {
-                    alert('Batch automation stream error.');
+                    document.getElementById('canvasBox').classList.add('hidden');
+                    document.getElementById('excelBox').classList.add('hidden');
+                    document.getElementById('pdfBox').classList.add('hidden');
+                    document.getElementById('welcome').classList.add('hidden');
+                    
+                    document.getElementById('errorText').innerText = e.message;
+                    document.getElementById('errorPanel').classList.remove('hidden');
                 } finally {
                     btn.innerText = "EXECUTE BATCH PROCESSING";
                     btn.disabled = false;
